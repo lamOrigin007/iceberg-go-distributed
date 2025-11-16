@@ -27,6 +27,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func withDeterministicSnapshotIDs(t *testing.T, values ...int64) {
+	original := snapshotIDGenerator
+	idx := 0
+	snapshotIDGenerator = func() int64 {
+		if idx >= len(values) {
+			idx++
+			return int64(idx)
+		}
+		val := values[idx]
+		idx++
+		return val
+	}
+	t.Cleanup(func() {
+		snapshotIDGenerator = original
+	})
+}
+
 func schema() iceberg.Schema {
 	return *iceberg.NewSchema(
 		0,
@@ -1308,4 +1325,31 @@ func generateTypeSchema(typ iceberg.Type) *iceberg.Schema {
 	)
 
 	return sc
+}
+
+func TestReserveSnapshotIDReturnsIncreasingValues(t *testing.T) {
+	b := builderWithoutChanges(2)
+	withDeterministicSnapshotIDs(t)
+	builder := &b
+	first := builder.ReserveSnapshotID()
+	second := builder.ReserveSnapshotID()
+	require.Less(t, first, second)
+}
+
+func TestReserveSnapshotIDCompatibleWithNewSnapshotID(t *testing.T) {
+	b := builderWithoutChanges(2)
+	withDeterministicSnapshotIDs(t, 1, 1, 2, 3)
+	builder := &b
+	reserved := builder.ReserveSnapshotID()
+	require.Equal(t, int64(1), reserved)
+	next := builder.newSnapshotID()
+	require.Equal(t, int64(2), next)
+	snapshot := &Snapshot{
+		SnapshotID:     reserved,
+		SequenceNumber: builder.nextSequenceNumber(),
+		TimestampMs:    time.Now().UnixMilli(),
+	}
+	require.NoError(t, builder.AddSnapshot(snapshot))
+	third := builder.newSnapshotID()
+	require.Equal(t, int64(3), third)
 }

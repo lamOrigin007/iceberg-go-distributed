@@ -158,24 +158,25 @@ type MetadataBuilder struct {
 	updates []Update
 
 	// common fields
-	formatVersion      int
-	uuid               uuid.UUID
-	loc                string
-	lastUpdatedMS      int64
-	lastColumnId       int
-	schemaList         []*iceberg.Schema
-	currentSchemaID    int
-	specs              []iceberg.PartitionSpec
-	defaultSpecID      int
-	lastPartitionID    *int
-	props              iceberg.Properties
-	snapshotList       []Snapshot
-	currentSnapshotID  *int64
-	snapshotLog        []SnapshotLogEntry
-	metadataLog        []MetadataLogEntry
-	sortOrderList      []SortOrder
-	defaultSortOrderID int
-	refs               map[string]SnapshotRef
+	formatVersion       int
+	uuid                uuid.UUID
+	loc                 string
+	lastUpdatedMS       int64
+	lastColumnId        int
+	schemaList          []*iceberg.Schema
+	currentSchemaID     int
+	specs               []iceberg.PartitionSpec
+	defaultSpecID       int
+	lastPartitionID     *int
+	props               iceberg.Properties
+	snapshotList        []Snapshot
+	reservedSnapshotIDs map[int64]struct{}
+	currentSnapshotID   *int64
+	snapshotLog         []SnapshotLogEntry
+	metadataLog         []MetadataLogEntry
+	sortOrderList       []SortOrder
+	defaultSortOrderID  int
+	refs                map[string]SnapshotRef
 
 	previousFileEntry *MetadataLogEntry
 	// >v1 specific
@@ -194,20 +195,21 @@ func NewMetadataBuilder(formatVersion int) (*MetadataBuilder, error) {
 	}
 
 	return &MetadataBuilder{
-		updates:            make([]Update, 0),
-		schemaList:         make([]*iceberg.Schema, 0),
-		specs:              make([]iceberg.PartitionSpec, 0),
-		props:              make(iceberg.Properties),
-		snapshotList:       make([]Snapshot, 0),
-		snapshotLog:        make([]SnapshotLogEntry, 0),
-		metadataLog:        make([]MetadataLogEntry, 0),
-		sortOrderList:      make([]SortOrder, 0),
-		refs:               make(map[string]SnapshotRef),
-		currentSchemaID:    -1,
-		defaultSortOrderID: -1,
-		defaultSpecID:      -1,
-		lastColumnId:       -1,
-		formatVersion:      formatVersion,
+		updates:             make([]Update, 0),
+		schemaList:          make([]*iceberg.Schema, 0),
+		specs:               make([]iceberg.PartitionSpec, 0),
+		props:               make(iceberg.Properties),
+		snapshotList:        make([]Snapshot, 0),
+		reservedSnapshotIDs: make(map[int64]struct{}),
+		snapshotLog:         make([]SnapshotLogEntry, 0),
+		metadataLog:         make([]MetadataLogEntry, 0),
+		sortOrderList:       make([]SortOrder, 0),
+		refs:                make(map[string]SnapshotRef),
+		currentSchemaID:     -1,
+		defaultSortOrderID:  -1,
+		defaultSpecID:       -1,
+		lastColumnId:        -1,
+		formatVersion:       formatVersion,
 	}, nil
 }
 
@@ -251,6 +253,7 @@ func MetadataBuilderFromBase(metadata Metadata, currentFileLocation string) (*Me
 	b.refs = maps.Collect(metadata.Refs())
 	b.snapshotLog = slices.Collect(metadata.SnapshotLogs())
 	b.metadataLog = slices.Collect(metadata.PreviousFiles())
+	b.reservedSnapshotIDs = make(map[int64]struct{})
 
 	if currentFileLocation != "" {
 		b.previousFileEntry = &MetadataLogEntry{
@@ -288,13 +291,51 @@ func (b *MetadataBuilder) nextSequenceNumber() int64 {
 	return 0
 }
 
+// ReserveSnapshotID reserves the next available snapshot ID without creating a snapshot.
+// The ID is marked as used to prevent future allocations from returning the same value.
+func (b *MetadataBuilder) ReserveSnapshotID() int64 {
+	return b.reserveSnapshotID()
+}
+
 func (b *MetadataBuilder) newSnapshotID() int64 {
-	snapshotID := generateSnapshotID()
-	for slices.ContainsFunc(b.snapshotList, func(s Snapshot) bool { return s.SnapshotID == snapshotID }) {
-		snapshotID = generateSnapshotID()
+	return b.reserveSnapshotID()
+}
+
+func (b *MetadataBuilder) reserveSnapshotID() int64 {
+	snapshotID := snapshotIDGenerator()
+	for b.snapshotIDInUse(snapshotID) {
+		snapshotID = snapshotIDGenerator()
 	}
 
+	if b.reservedSnapshotIDs == nil {
+		b.reservedSnapshotIDs = make(map[int64]struct{})
+	}
+	b.reservedSnapshotIDs[snapshotID] = struct{}{}
+
 	return snapshotID
+}
+
+var snapshotIDGenerator = generateSnapshotID
+
+func (b *MetadataBuilder) snapshotIDInUse(snapshotID int64) bool {
+	if slices.ContainsFunc(b.snapshotList, func(s Snapshot) bool { return s.SnapshotID == snapshotID }) {
+		return true
+	}
+	if _, ok := b.reservedSnapshotIDs[snapshotID]; ok {
+		return true
+	}
+
+	return false
+}
+
+func (b *MetadataBuilder) releaseSnapshotReservation(snapshotID int64) {
+	if b.reservedSnapshotIDs == nil {
+		return
+	}
+	delete(b.reservedSnapshotIDs, snapshotID)
+	if len(b.reservedSnapshotIDs) == 0 {
+		b.reservedSnapshotIDs = nil
+	}
 }
 
 func (b *MetadataBuilder) currentSnapshot() *Snapshot {
@@ -421,6 +462,8 @@ func (b *MetadataBuilder) AddSnapshot(snapshot *Snapshot) error {
 		return fmt.Errorf("invalid snapshot timestamp %d: before last updated timestamp %d",
 			snapshot.TimestampMs, maxTS)
 	}
+
+	b.releaseSnapshotReservation(snapshot.SnapshotID)
 
 	b.updates = append(b.updates, NewAddSnapshotUpdate(snapshot))
 	b.lastUpdatedMS = snapshot.TimestampMs
