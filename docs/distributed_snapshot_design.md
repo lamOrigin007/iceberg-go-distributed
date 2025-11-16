@@ -72,3 +72,16 @@
 - Requirements ensure that if two coordinators race on the same reservation, only one succeeds; the other sees that the reservation has been consumed when it validates requirements before commit.
 
 This document captures the baseline behavior of the v0.4.0 transaction stack and the high-level plan for extending it to distributed snapshots with shared snapshot IDs. Future iterations should break down the proposed APIs into concrete Go types and catalog protocol changes.
+
+## Commit из готовых manifest’ов
+
+- `Transaction.commitSnapshotFromManifests()` (table/transaction.go) writes a manifest list for a caller-provided `snapshotID` by serializing the supplied `[]ManifestFile` without touching the underlying manifest contents. The helper reuses `newManifestListFileName()` so the manifest list location stays deterministic.
+- After the manifest list is persisted the helper builds a `Snapshot` struct (sequence number, schema ID, timestamp, summary, manifest list path) and enqueues the usual updates (`AddSnapshot`, `SetSnapshotRef`). Metadata state therefore mirrors the result of a local `snapshotProducer.commit()` even though manifests were prepared elsewhere.
+- The helper is intentionally internal to `Transaction` for now; future distributed writers can reserve snapshot IDs, write manifests on worker hosts, and then call this coordinator path to finalize metadata.
+
+### Проверки перед коммитом
+
+- `AssertRefSnapshotID` is added to the transaction requirements so optimistic concurrency still ensures the main branch references the expected parent snapshot when the coordinator applies the metadata updates.
+- The builder assigns sequence numbers via `MetadataBuilder.nextSequenceNumber()`; `AddSnapshot` subsequently validates that the new sequence number is strictly greater than the previously committed one on v2+ tables.
+- `MetadataBuilder.AddSnapshot` also enforces timestamp monotonicity (snapshot timestamp must be newer than both the snapshot log and the table’s `lastUpdated` value) and verifies that schema/spec metadata already exists before the snapshot is appended.
+- Because the manifest list path is generated through the table’s `LocationProvider`, retries continue to overwrite the same logical manifest list file until the snapshot is successfully registered, matching the single-writer behavior.

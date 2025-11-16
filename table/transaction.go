@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"runtime"
 	"slices"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/internal"
 	"github.com/apache/iceberg-go/io"
 	"github.com/google/uuid"
 )
@@ -133,6 +135,75 @@ func (t *Transaction) updateSnapshot(fs io.IO, props iceberg.Properties) snapsho
 		io:            fs.(io.WriteFileIO),
 		snapshotProps: props,
 	}
+}
+
+func (t *Transaction) commitSnapshotFromManifests(
+	ctx context.Context,
+	snapshotID int64,
+	parentSnapshotID *int64,
+	manifests []iceberg.ManifestFile,
+	summary Summary,
+) (err error) {
+	fs, err := t.tbl.fsF(ctx)
+	if err != nil {
+		return err
+	}
+	writeIO, ok := fs.(io.WriteFileIO)
+	if !ok {
+		return errors.New("table file IO does not support writing manifests")
+	}
+
+	locProvider, err := t.tbl.LocationProvider()
+	if err != nil {
+		return err
+	}
+
+	manifestListPath := locProvider.NewMetadataLocation(
+		newManifestListFileName(snapshotID, 0, uuid.New()),
+	)
+	out, err := writeIO.Create(manifestListPath)
+	if err != nil {
+		return err
+	}
+	defer internal.CheckedClose(out, &err)
+
+	nextSequence := t.meta.nextSequenceNumber()
+	if err = iceberg.WriteManifestList(
+		t.meta.formatVersion,
+		out,
+		snapshotID,
+		parentSnapshotID,
+		&nextSequence,
+		0,
+		manifests,
+	); err != nil {
+		return err
+	}
+
+	summaryCopy := Summary{Operation: summary.Operation}
+	if len(summary.Properties) > 0 {
+		summaryCopy.Properties = maps.Clone(summary.Properties)
+	}
+	schemaID := t.meta.currentSchemaID
+	snapshot := Snapshot{
+		SnapshotID:       snapshotID,
+		ParentSnapshotID: parentSnapshotID,
+		SequenceNumber:   nextSequence,
+		ManifestList:     manifestListPath,
+		Summary:          &summaryCopy,
+		SchemaID:         &schemaID,
+		TimestampMs:      time.Now().UnixMilli(),
+	}
+
+	updates := []Update{
+		NewAddSnapshotUpdate(&snapshot),
+		NewSetSnapshotRefUpdate(MainBranch, snapshotID, BranchRef, -1, -1, -1),
+	}
+	reqs := []Requirement{
+		AssertRefSnapshotID(MainBranch, t.meta.currentSnapshotID),
+	}
+
+	return t.apply(updates, reqs)
 }
 
 func (t *Transaction) SetProperties(props iceberg.Properties) error {
