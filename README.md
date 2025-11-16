@@ -21,6 +21,10 @@
 
 `iceberg` is a Golang implementation of the [Iceberg table spec](https://iceberg.apache.org/spec/).
 
+## Design notes
+
+- [Distributed snapshot design](docs/distributed_snapshot_design.md)
+
 ## Build From Source
 
 ### Prerequisites
