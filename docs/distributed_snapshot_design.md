@@ -50,6 +50,11 @@
 - Each worker reports back the manifest metadata (file path, partition spec ID, statistics) along with per-manifest sequence metadata (if assigned locally). The coordinator stores these descriptors in a temporary manifest index table or an object store manifest queue.
 - Workers can reuse the existing manifest merge and summary logic by operating over their local file batches. The summary output becomes part of the worker result so the coordinator can merge summaries.
 
+### External/Distributed Manifest Writer
+- A new helper, `iceberg.NewManifestWriterForSnapshot`, lets workers create manifest files for a pre-reserved snapshot ID without a `Transaction`.
+- Callers provide the table’s `WriteFileIO`, partition spec, schema, manifest format version, snapshot ID, and the full manifest file path. The helper opens the file, wraps it in a counting writer, and returns an `ExternalManifestWriter` that embeds the regular `ManifestWriter` API.
+- When `ExternalManifestWriter.ToManifestFile()` is invoked the manifest file is closed and the returned `ManifestFile` metadata is populated with the supplied snapshot ID, ensuring every encoded `ManifestEntry` inherits the same snapshot reference.
+
 ### Coordinator assembly and commit
 - The coordinator retrieves all manifest descriptors associated with the reservation, groups them by content (data vs. delete), and optionally runs the manifest merge routines before writing the manifest list.
 - Sequence number management happens centrally: the coordinator asks the catalog for the current `lastSequenceNumber` and writes `nextSequenceNumber` into the manifest list and snapshot entry exactly once.

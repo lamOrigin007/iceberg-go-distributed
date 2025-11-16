@@ -1120,6 +1120,82 @@ func NewManifestWriter(version int, out io.Writer, spec PartitionSpec, schema *S
 	return w, err
 }
 
+// ExternalManifestWriter wraps ManifestWriter so it can be used by distributed
+// workers that already know the manifest file path and snapshot ID they should
+// target. It keeps track of the file length and closes the underlying
+// WriteCloser when the manifest file is materialized.
+type ExternalManifestWriter struct {
+	*ManifestWriter
+	location string
+	counter  *internal.CountingWriter
+	output   io.Closer
+}
+
+// NewManifestWriterForSnapshot creates a manifest writer that writes directly to
+// the provided path using the supplied WriteFileIO implementation. All entries
+// added to this writer inherit the supplied snapshotID.
+func NewManifestWriterForSnapshot(
+	fs iceio.WriteFileIO,
+	version int,
+	spec PartitionSpec,
+	schema *Schema,
+	snapshotID int64,
+	path string,
+) (*ExternalManifestWriter, error) {
+	if fs == nil {
+		return nil, fmt.Errorf("%w: file IO cannot be nil", ErrInvalidArgument)
+	}
+	if schema == nil {
+		return nil, fmt.Errorf("%w: schema cannot be nil", ErrInvalidArgument)
+	}
+	if path == "" {
+		return nil, fmt.Errorf("%w: path cannot be empty", ErrInvalidArgument)
+	}
+
+	out, err := fs.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("could not create manifest file: %w", err)
+	}
+
+	counter := &internal.CountingWriter{W: out}
+	writer, err := NewManifestWriter(version, counter, spec, schema, snapshotID)
+	if err != nil {
+		return nil, errors.Join(err, out.Close())
+	}
+
+	return &ExternalManifestWriter{
+		ManifestWriter: writer,
+		location:       path,
+		counter:        counter,
+		output:         out,
+	}, nil
+}
+
+func (w *ExternalManifestWriter) closeOutput() error {
+	if w.output == nil {
+		return nil
+	}
+
+	err := w.output.Close()
+	w.output = nil
+
+	return err
+}
+
+// ToManifestFile closes the writer, flushes the underlying file, and returns
+// the manifest metadata describing the file at the configured location.
+func (w *ExternalManifestWriter) ToManifestFile() (ManifestFile, error) {
+	mf, err := w.ManifestWriter.ToManifestFile(w.location, w.counter.Count)
+
+	return mf, errors.Join(err, w.closeOutput())
+}
+
+// Close stops the writer without returning manifest metadata. This can be used
+// to abort a manifest write and ensure resources are released.
+func (w *ExternalManifestWriter) Close() error {
+	return errors.Join(w.ManifestWriter.Close(), w.closeOutput())
+}
+
 func (w *ManifestWriter) Close() error {
 	if w.closed {
 		return nil

@@ -20,12 +20,16 @@ package iceberg
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/apache/iceberg-go/internal"
+	iceio "github.com/apache/iceberg-go/io"
 	"github.com/hamba/avro/v2"
 	"github.com/hamba/avro/v2/ocf"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -1368,6 +1372,51 @@ func (m *ManifestTestSuite) TestManifestWriterMeta() {
 	m.Require().NoError(err)
 	m.NotEqual("null", string(md["partition-spec"]))
 	m.Equal("[]", string(md["partition-spec"]))
+}
+
+func TestExternalManifestWriter(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	fs := iceio.LocalFS{}
+	schema := NewSchema(1,
+		NestedField{ID: 1, Name: "id", Type: Int64Type{}},
+		NestedField{ID: 2, Name: "data", Type: StringType{}},
+	)
+	snapshotID := int64(123456789)
+	spec := *UnpartitionedSpec
+	manifestPath := filepath.Join(dir, "worker", "external-manifest.avro")
+
+	writer, err := NewManifestWriterForSnapshot(fs, 2, spec, schema, snapshotID, manifestPath)
+	require.NoError(t, err)
+
+	dataBuilder1, err := NewDataFileBuilder(spec, EntryContentData, filepath.Join(dir, "data-1.parquet"), ParquetFile,
+		map[int]any{}, map[int]avro.LogicalType{}, map[int]int{}, 10, 1024,
+	)
+	require.NoError(t, err)
+	require.NoError(t, writer.Add(NewManifestEntry(EntryStatusADDED, nil, nil, nil, dataBuilder1.Build())))
+
+	dataBuilder2, err := NewDataFileBuilder(spec, EntryContentData, filepath.Join(dir, "data-2.parquet"), ParquetFile,
+		map[int]any{}, map[int]avro.LogicalType{}, map[int]int{}, 20, 2048,
+	)
+	require.NoError(t, err)
+	require.NoError(t, writer.Add(NewManifestEntry(EntryStatusADDED, nil, nil, nil, dataBuilder2.Build())))
+
+	manifestFile, err := writer.ToManifestFile()
+	require.NoError(t, err)
+	require.Equal(t, snapshotID, manifestFile.SnapshotID())
+	require.Equal(t, manifestPath, manifestFile.FilePath())
+
+	file, err := os.Open(manifestPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, file.Close()) })
+
+	entries, err := ReadManifest(manifestFile, file, false)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	for _, entry := range entries {
+		require.Equal(t, snapshotID, entry.SnapshotID())
+	}
 }
 
 func TestManifests(t *testing.T) {
