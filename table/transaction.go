@@ -143,6 +143,24 @@ func (t *Transaction) commitSnapshotFromManifests(
 	parentSnapshotID *int64,
 	manifests []iceberg.ManifestFile,
 	summary Summary,
+) error {
+	return t.commitSnapshotFromManifestsWithRequirement(
+		ctx,
+		snapshotID,
+		parentSnapshotID,
+		manifests,
+		summary,
+		t.meta.currentSnapshotID,
+	)
+}
+
+func (t *Transaction) commitSnapshotFromManifestsWithRequirement(
+	ctx context.Context,
+	snapshotID int64,
+	parentSnapshotID *int64,
+	manifests []iceberg.ManifestFile,
+	summary Summary,
+	expectedRefSnapshotID *int64,
 ) (err error) {
 	fs, err := t.tbl.fsF(ctx)
 	if err != nil {
@@ -200,7 +218,7 @@ func (t *Transaction) commitSnapshotFromManifests(
 		NewSetSnapshotRefUpdate(MainBranch, snapshotID, BranchRef, -1, -1, -1),
 	}
 	reqs := []Requirement{
-		AssertRefSnapshotID(MainBranch, t.meta.currentSnapshotID),
+		AssertRefSnapshotID(MainBranch, expectedRefSnapshotID),
 	}
 
 	return t.apply(updates, reqs)
