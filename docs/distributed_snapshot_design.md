@@ -97,3 +97,84 @@ This document captures the baseline behavior of the v0.4.0 transaction stack and
 - `Table.BeginDistributedSnapshot(ctx, props)` reserves a new snapshot ID using the current table metadata and returns a `DistributedSnapshot` descriptor. The descriptor includes the reserved `snapshotID`, the parent snapshot ID (if any), a commit UUID that worker hosts can use to derive manifest file names, and a copy of the snapshot properties that should be applied during commit. Coordinators call this method once before fanning out work to worker hosts.
 - `Table.CommitDistributedSnapshot(ctx, ds, manifests, summary)` accepts the `DistributedSnapshot` from the coordinator, the list of manifest files produced by worker hosts, and a summary map that contains at least the `operation` key. The method validates that the table’s main branch still references `ds.ParentSnapshotID`, writes the manifest list, enqueues the snapshot updates, and commits them through the catalog. On success it returns a refreshed `Table` instance with the new snapshot set as current.
 - Worker hosts use the `DistributedSnapshot` payload (especially `SnapshotID` and `CommitUUID`) to produce manifest files independently. Once all manifests are available, the coordinator aggregates them into a slice of `ManifestFile` descriptors and invokes `CommitDistributedSnapshot`.
+
+## Usage example
+
+The snippet below demonstrates how a coordinator can reserve a distributed snapshot, let workers emit manifests, and then commit the snapshot once every manifest is available. In production deployments multiple workers would repeat the manifest-writing block; the example keeps only one worker for brevity.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/apache/iceberg-go"
+    "github.com/apache/iceberg-go/catalog"
+    iceio "github.com/apache/iceberg-go/io"
+    "github.com/apache/iceberg-go/table"
+)
+
+func main() {
+    ctx := context.Background()
+
+    cat, err := catalog.Load(ctx, "prod", nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    tbl, err := cat.LoadTable(ctx, table.Identifier{"db", "events"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    props := iceberg.Properties{"commit.user": "coordinator"}
+    ds, err := tbl.BeginDistributedSnapshot(ctx, props)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Workers derive deterministic manifest file names from the reservation.
+    fsys, err := tbl.FS(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    writeIO, ok := fsys.(iceio.WriteFileIO)
+    if !ok {
+        log.Fatal("table IO does not allow writing manifests")
+    }
+    manifestPath := fmt.Sprintf("%s/metadata/%s-worker-%d.avro", tbl.Location(), ds.CommitUUID, 0)
+    writer, err := iceberg.NewManifestWriterForSnapshot(
+        writeIO,
+        tbl.Metadata().Version(),
+        tbl.Spec(),
+        tbl.Schema(),
+        ds.SnapshotID,
+        manifestPath,
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Each worker adds its own files and materializes a ManifestFile descriptor.
+    // writer.Add(dataFile)
+    manifest, err := writer.ToManifestFile()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    summary := map[string]string{
+        "operation":         "append",
+        "added-data-files":  "1",
+        "added-records":     "1000",
+    }
+    updated, err := tbl.CommitDistributedSnapshot(ctx, ds, []iceberg.ManifestFile{manifest}, summary)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Committed snapshot %d for table %s\n", updated.CurrentSnapshot().SnapshotID, updated.Identifier())
+}
+```
+
+The coordinator fans out the `DistributedSnapshot` payload to every worker, collects the resulting `ManifestFile` descriptors, and uses the returned `*table.Table` to refresh its in-memory view once `CommitDistributedSnapshot` succeeds.
