@@ -86,6 +86,12 @@ This document captures the baseline behavior of the v0.4.0 transaction stack and
 - `MetadataBuilder.AddSnapshot` also enforces timestamp monotonicity (snapshot timestamp must be newer than both the snapshot log and the table’s `lastUpdated` value) and verifies that schema/spec metadata already exists before the snapshot is appended.
 - Because the manifest list path is generated through the table’s `LocationProvider`, retries continue to overwrite the same logical manifest list file until the snapshot is successfully registered, matching the single-writer behavior.
 
+### Оптимистичная конкуренция и обработка конфликтов
+
+- Координатор распределённого снапшота использует `Transaction.commitSnapshotFromManifestsWithRequirement`, поэтому `nextSequenceNumber()` вызывается только один раз при формировании manifest list. Сами distributed commits получают последовательные `sequenceNumber`, как и локальные транзакции.
+- `CommitDistributedSnapshot` добавляет тот же набор требований, что и обычный `snapshotProducer`: минимум `AssertRefSnapshotID` для `main` плюс `AssertTableUUID`, который автоматически добавляется перед `Transaction.Commit`. Каталог валидирует требования, и при их нарушении возвращается ошибка «requirement failed».
+- Если между `BeginDistributedSnapshot` и коммитом кто-то другой успел сдвинуть `main`, то `AssertRefSnapshotID` обнаружит расхождение, коммит распределённого снапшота будет отклонён, а сторонний коммит останется в силе. Координатор должен перезапустить процесс с новым `BeginDistributedSnapshot`.
+
 ## Public API (Table)
 
 - `Table.BeginDistributedSnapshot(ctx, props)` reserves a new snapshot ID using the current table metadata and returns a `DistributedSnapshot` descriptor. The descriptor includes the reserved `snapshotID`, the parent snapshot ID (if any), a commit UUID that worker hosts can use to derive manifest file names, and a copy of the snapshot properties that should be applied during commit. Coordinators call this method once before fanning out work to worker hosts.

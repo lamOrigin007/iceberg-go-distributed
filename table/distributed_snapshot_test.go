@@ -93,6 +93,7 @@ func TestTableDistributedSnapshotLifecycle(t *testing.T) {
 	updatedTbl, err := tbl.CommitDistributedSnapshot(ctx, ds, manifests, summary)
 	require.NoError(t, err)
 	require.Equal(t, ds.SnapshotID, updatedTbl.CurrentSnapshot().SnapshotID)
+	require.Equal(t, int64(1), updatedTbl.CurrentSnapshot().SequenceNumber)
 	require.Equal(t, OpAppend, updatedTbl.CurrentSnapshot().Summary.Operation)
 	require.Equal(t, "true", updatedTbl.CurrentSnapshot().Summary.Properties["distributed"])
 
@@ -120,10 +121,86 @@ func TestTableDistributedSnapshotLifecycle(t *testing.T) {
 	finalTbl, err := updatedTbl.CommitDistributedSnapshot(ctx, secondDS, secondManifests, secondSummary)
 	require.NoError(t, err)
 	require.Equal(t, secondDS.SnapshotID, finalTbl.CurrentSnapshot().SnapshotID)
+	require.Equal(t, int64(2), finalTbl.CurrentSnapshot().SequenceNumber)
 	require.Equal(t, 2, len(finalTbl.Metadata().Snapshots()))
 	require.NotNil(t, finalTbl.CurrentSnapshot().ParentSnapshotID)
 	require.Equal(t, ds.SnapshotID, *finalTbl.CurrentSnapshot().ParentSnapshotID)
 	verifyManifestList(t, memIO, finalTbl.CurrentSnapshot(), secondManifests)
+}
+
+func TestCommitDistributedSnapshotFailsOnConcurrentCommit(t *testing.T) {
+	ctx := context.Background()
+	memIO := newInMemoryWriteFileIO()
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+	)
+	meta, err := NewMetadata(schema, iceberg.UnpartitionedSpec, UnsortedSortOrder,
+		"s3://bucket/test/location", iceberg.Properties{})
+	require.NoError(t, err)
+	spec := meta.PartitionSpec()
+	specID := int32((&spec).ID())
+
+	cat := &distributedSnapshotTestCatalog{metadata: meta}
+	identifier := Identifier{"default", "tbl"}
+	tbl := New(identifier, meta, "s3://bucket/test/location/metadata/v1.json",
+		func(context.Context) (iceio.IO, error) { return memIO, nil }, cat)
+
+	bootstrapProps := iceberg.Properties{"stage": "bootstrap"}
+	bootstrapDS, err := tbl.BeginDistributedSnapshot(ctx, bootstrapProps)
+	require.NoError(t, err)
+	bootstrapManifests := []iceberg.ManifestFile{
+		iceberg.NewManifestFile(meta.Version(),
+			fmt.Sprintf("%s/metadata/%s-bootstrap.avro", tbl.Location(), bootstrapDS.CommitUUID),
+			64,
+			specID,
+			bootstrapDS.SnapshotID,
+		).
+			AddedFiles(1).
+			AddedRows(5).
+			Build(),
+	}
+	bootstrapSummary := map[string]string{operationKey: string(OpAppend)}
+	tbl, err = tbl.CommitDistributedSnapshot(ctx, bootstrapDS, bootstrapManifests, bootstrapSummary)
+	require.NoError(t, err)
+
+	staleTable := *tbl
+	coordinator := &staleTable
+	pendingDS, err := coordinator.BeginDistributedSnapshot(ctx, iceberg.Properties{"attempt": "stale"})
+	require.NoError(t, err)
+	pendingManifests := []iceberg.ManifestFile{
+		iceberg.NewManifestFile(meta.Version(),
+			fmt.Sprintf("%s/metadata/%s-stale.avro", coordinator.Location(), pendingDS.CommitUUID),
+			128,
+			specID,
+			pendingDS.SnapshotID,
+		).
+			AddedFiles(2).
+			AddedRows(10).
+			Build(),
+	}
+	pendingSummary := map[string]string{operationKey: string(OpAppend)}
+
+	concurrentDS, err := tbl.BeginDistributedSnapshot(ctx, iceberg.Properties{"attempt": "winner"})
+	require.NoError(t, err)
+	concurrentManifests := []iceberg.ManifestFile{
+		iceberg.NewManifestFile(meta.Version(),
+			fmt.Sprintf("%s/metadata/%s-concurrent.avro", tbl.Location(), concurrentDS.CommitUUID),
+			256,
+			specID,
+			concurrentDS.SnapshotID,
+		).
+			AddedFiles(3).
+			AddedRows(15).
+			Build(),
+	}
+	concurrentSummary := map[string]string{operationKey: string(OpAppend)}
+	_, err = tbl.CommitDistributedSnapshot(ctx, concurrentDS, concurrentManifests, concurrentSummary)
+	require.NoError(t, err)
+
+	_, err = coordinator.CommitDistributedSnapshot(ctx, pendingDS, pendingManifests, pendingSummary)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "requirement failed")
+	require.Equal(t, concurrentDS.SnapshotID, cat.metadata.CurrentSnapshot().SnapshotID)
 }
 
 func verifyManifestList(t *testing.T, fs *inMemoryWriteFileIO, snap *Snapshot, manifests []iceberg.ManifestFile) {
