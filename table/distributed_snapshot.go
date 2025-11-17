@@ -19,7 +19,6 @@ package table
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 
@@ -30,10 +29,20 @@ import (
 // DistributedSnapshot captures the metadata required to coordinate a distributed
 // snapshot commit between a coordinator and multiple worker hosts.
 type DistributedSnapshot struct {
-	SnapshotID       int64
+	// SnapshotID is the reserved identifier that every worker host must embed in
+	// the manifest files it produces for this distributed commit.
+	SnapshotID int64
+	// ParentSnapshotID references the snapshot that was current when the
+	// reservation happened. Coordinators pass the value back to
+	// CommitDistributedSnapshot so optimistic concurrency checks can verify that
+	// the branch head has not advanced since.
 	ParentSnapshotID *int64
-	CommitUUID       uuid.UUID
-	SnapshotProps    iceberg.Properties
+	// CommitUUID is a randomly generated value that can be used to derive
+	// deterministic manifest file names across workers.
+	CommitUUID uuid.UUID
+	// SnapshotProps contains snapshot-level properties that should be attached to
+	// the final snapshot summary. Callers should treat the map as immutable.
+	SnapshotProps iceberg.Properties
 }
 
 // BeginDistributedSnapshot reserves a snapshot ID and returns the metadata that
@@ -78,7 +87,7 @@ func (t *Table) CommitDistributedSnapshot(
 	summary map[string]string,
 ) (*Table, error) {
 	if ds == nil {
-		return nil, errors.New("distributed snapshot cannot be nil")
+		return nil, fmt.Errorf("%w: distributed snapshot descriptor cannot be nil", iceberg.ErrInvalidArgument)
 	}
 	if len(manifests) == 0 {
 		return nil, fmt.Errorf("%w: at least one manifest file is required", iceberg.ErrInvalidArgument)
